@@ -17,6 +17,9 @@ def test_compute_dim_small_data():
         "participation_ratio",
         "shannon_entropy",
         "geometric_mean_eff_dimensionality",
+        "stable_rank",
+        "numerical_rank",
+        "cumulative_eigenvalue_ratio",
         "mle_dimensionality",
         "two_nn_dimensionality"
     ]

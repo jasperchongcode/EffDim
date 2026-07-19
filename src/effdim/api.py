@@ -20,6 +20,9 @@ from .metrics import (
     pca_explained_variance,
     renyi_eff_dimensionality,
     shannon_entropy,
+    stable_rank,
+    numerical_rank,
+    cumulative_eigenvalue_ratio,
 )
 
 
@@ -75,6 +78,11 @@ def compute_dim(data: Union[np.ndarray, List[np.ndarray]]) -> Dict[str, Any]:
     results["geometric_mean_eff_dimensionality"] = geometric_mean_eff_dimensionality(
         probabilities
     )
+
+    # Added Missing Spectral Estimators
+    results["stable_rank"] = stable_rank(eigenvalues)
+    results["numerical_rank"] = numerical_rank(s)
+    results["cumulative_eigenvalue_ratio"] = cumulative_eigenvalue_ratio(probabilities)
 
     # Compute KNN distances once for the largest k needed (MLE uses k=10 by default)
     # We use k=10 as a safe upper bound for default usage.
