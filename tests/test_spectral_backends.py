@@ -40,6 +40,15 @@ class TestPrivateSpectralHelpers:
             atol=1e-8,
         )
 
+    def test_streaming_is_stable_for_large_mean_offset(self):
+        rng = np.random.default_rng(8)
+        X = rng.standard_normal((500, 32)) + 1e9
+
+        evals_cov = _do_streaming_covariance(X, batch_size=37)
+        evals_svd = _do_svd(X - X.mean(axis=0))
+
+        np.testing.assert_allclose(evals_cov, evals_svd, rtol=1e-7, atol=1e-8)
+
     def test_batching_matches_oneshot(self):
         rng = np.random.default_rng(1)
         X = rng.standard_normal((1000, 40)) + 5.0
@@ -106,6 +115,17 @@ class TestComputeDimBackendSwap:
         cov = compute_dim(data, spectral_backend="streaming_covariance")
         svd = compute_dim(data, spectral_backend="svd")
         assert set(cov) == set(svd)
+
+    def test_wide_data_warns_and_falls_back_to_svd(self):
+        rng = np.random.default_rng(9)
+        data = rng.standard_normal((20, 30))
+
+        with pytest.warns(RuntimeWarning, match="falling back to the SVD"):
+            cov = compute_dim(data, spectral_backend="streaming_covariance")
+        svd = compute_dim(data, spectral_backend="svd")
+
+        for key in SPECTRAL_KEYS:
+            assert np.isclose(cov[key], svd[key], rtol=1e-12)
 
     def test_invalid_backend_raises(self):
         data = np.random.default_rng(0).standard_normal((20, 3))

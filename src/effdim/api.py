@@ -1,3 +1,4 @@
+import warnings
 from typing import Any, Dict, Iterable, List, Optional, Union
 
 import numpy as np
@@ -43,8 +44,10 @@ def compute_dim(
         Backend used to obtain the sample-covariance eigenvalue spectrum for
         spectral ED metrics. The return keys are identical for both backends.
 
-        - ``"streaming_covariance"`` (default): accumulate ``XᵀX`` (optionally
-          in row batches) and take ``eigvalsh`` of the ``d×d`` covariance.
+        - ``"streaming_covariance"`` (default): accumulate centered covariance
+          statistics (optionally in row batches) and take ``eigvalsh`` of the
+          ``d×d`` covariance. Falls back to SVD when samples are fewer than
+          features.
         - ``"svd"``: thin/randomized SVD of centered data, then
           ``λ = s² / (n - 1)``.
     batch_size : int, optional
@@ -70,8 +73,17 @@ def compute_dim(
         )
 
     if spectral_backend == "streaming_covariance":
-        eigenvalues = _do_streaming_covariance(data, batch_size=batch_size)
         data_centered = _ensure_centered(data)
+        if data.shape[0] < data.shape[1]:
+            warnings.warn(
+                "n_samples < n_features; falling back to the SVD spectral backend "
+                "to avoid forming a larger feature covariance matrix.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            eigenvalues = _do_svd(data_centered)
+        else:
+            eigenvalues = _do_streaming_covariance(data, batch_size=batch_size)
     else:
         data_centered = _ensure_centered(data)
         eigenvalues = _do_svd(data_centered)
@@ -160,10 +172,10 @@ def _do_streaming_covariance(
     """
     Sample-covariance eigenvalues via batched accumulation of XᵀX.
 
-    Does not require a pre-centered full matrix copy. Accumulates in float64,
-    then returns eigenvalues of
-        C = (S - n μμᵀ) / (n - ddof)
-    in descending order, with tiny negative roundoff clipped to zero.
+    Does not require a pre-centered full matrix copy. Each row batch is centered
+    around its own mean and its centered sum of products is merged into the
+    running covariance using the parallel-variance update. Accumulation is in
+    float64.
 
     Parameters
     ----------
@@ -188,23 +200,30 @@ def _do_streaming_covariance(
     if n_samples < 2:
         return np.zeros(n_features, dtype=np.float64)
 
-    S = np.zeros((n_features, n_features), dtype=np.float64)
-    s = np.zeros(n_features, dtype=np.float64)
+    mean = np.zeros(n_features, dtype=np.float64)
+    M2 = np.zeros((n_features, n_features), dtype=np.float64)
     n = 0
 
     for Xb in _iter_row_batches(data, batch_size):
         Xb64 = np.asarray(Xb, dtype=np.float64, order="C")
-        S += Xb64.T @ Xb64
-        s += Xb64.sum(axis=0)
-        n += Xb64.shape[0]
+        batch_n = Xb64.shape[0]
+        batch_mean = Xb64.mean(axis=0)
+        Xb_centered = Xb64 - batch_mean
+        batch_M2 = Xb_centered.T @ Xb_centered
 
-    mu = s / n
+        new_n = n + batch_n
+        delta = batch_mean - mean
+        M2 += batch_M2
+        if n:
+            M2 += np.outer(delta, delta) * (n * batch_n / new_n)
+        mean += delta * (batch_n / new_n)
+        n = new_n
+
     denom = n - ddof
     if denom <= 0:
         return np.zeros(n_features, dtype=np.float64)
 
-    C = S - n * np.outer(mu, mu)
-    C /= denom
+    C = M2 / denom
     C = 0.5 * (C + C.T)
 
     evals = np.linalg.eigvalsh(C)  # ascending
