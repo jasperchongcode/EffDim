@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, Iterable, List, Optional, Union
 
 import numpy as np
 from sklearn.utils.extmath import randomized_svd
@@ -22,64 +22,83 @@ from .metrics import (
     shannon_entropy,
 )
 
+_VALID_SPECTRAL_BACKENDS = ("streaming_covariance", "svd")
 
-def compute_dim(data: Union[np.ndarray, List[np.ndarray]]) -> Dict[str, Any]:
+
+def compute_dim(
+    data: Union[np.ndarray, List[np.ndarray]],
+    *,
+    spectral_backend: str = "streaming_covariance",
+    batch_size: Optional[int] = None,
+) -> Dict[str, Any]:
     """
-    Compute the effective dimensionality of the given data using the specified method.
+    Compute the effective dimensionality of the given data.
 
-    Parameters:
-    -----------
-    data : Union[np.ndarray, List[np.ndarray]]
-        Input data. Can be a single numpy array or a list of numpy arrays.
-    Returns: dict
-        A dictionary containing the results of the effective dimensionality computation.
+    Parameters
+    ----------
+    data : numpy.ndarray or list of numpy.ndarray
+        Input data as a single ``(n_samples, n_features)`` array, or a list of
+        arrays that will be stacked along the sample axis.
+    spectral_backend : {"streaming_covariance", "svd"}, optional
+        Backend used to obtain the sample-covariance eigenvalue spectrum for
+        spectral ED metrics. The return keys are identical for both backends.
+
+        - ``"streaming_covariance"`` (default): accumulate ``XᵀX`` (optionally
+          in row batches) and take ``eigvalsh`` of the ``d×d`` covariance.
+        - ``"svd"``: thin/randomized SVD of centered data, then
+          ``λ = s² / (n - 1)``.
+    batch_size : int, optional
+        Row batch size for ``spectral_backend="streaming_covariance"``.
+        Ignored by the SVD backend. ``None`` processes all rows in one GEMM.
+
+    Returns
+    -------
+    dict
+        Spectral and geometric effective / intrinsic dimensionality estimates.
     """
     results: Dict[str, Any] = {}
 
-    # Getting the data and then converting to numpy array if it's a list
     if isinstance(data, list):
         data = np.vstack(data)
     elif not isinstance(data, np.ndarray):
         raise ValueError("Input data must be a numpy array or a list of numpy arrays.")
 
-    # Ensure the data is centered
-    data = _ensure_centered(data)
-    s = _do_svd(data)
+    if spectral_backend not in _VALID_SPECTRAL_BACKENDS:
+        raise ValueError(
+            f"Unknown spectral_backend={spectral_backend!r}. "
+            f"Expected one of {_VALID_SPECTRAL_BACKENDS}."
+        )
 
-    # gettinf the eigenvalues from the singular values for the covariance matrix
-    eigenvalues = (s**2) / (data.shape[0] - 1)
+    if spectral_backend == "streaming_covariance":
+        eigenvalues = _do_streaming_covariance(data, batch_size=batch_size)
+        data_centered = _ensure_centered(data)
+    else:
+        data_centered = _ensure_centered(data)
+        eigenvalues = _do_svd(data_centered)
 
-    # Total variance
     total_variance = np.sum(eigenvalues)
-
-    #  getting the probabilities
     if total_variance == 0:
         probabilities = np.zeros_like(eigenvalues)
     else:
         probabilities = eigenvalues / total_variance
 
-    # Computing various effective dimensionalities
     results["pca_explained_variance_95"] = pca_explained_variance(
         eigenvalues, threshold=0.95
     )
     results["participation_ratio"] = participation_ratio(eigenvalues)
     results["shannon_entropy"] = shannon_entropy(probabilities)
 
-    # Renyi effective dimensionalities for alpha = 2,3,4,5
     for i in range(2, 6):
         results[f"renyi_eff_dimensionality_alpha_{i}"] = renyi_eff_dimensionality(
             probabilities, alpha=i
         )
 
-    # Geometric Dimensions
     results["geometric_mean_eff_dimensionality"] = geometric_mean_eff_dimensionality(
         probabilities
     )
 
-    # Compute KNN distances once for the largest k needed (MLE uses k=10 by default)
-    # We use k=10 as a safe upper bound for default usage.
-    # Convert data to float32 contiguous array once for geometry functions
-    data_f32 = np.ascontiguousarray(data, dtype=np.float32)
+    # Geometric path uses centered float32 data + FAISS kNN.
+    data_f32 = np.ascontiguousarray(data_centered, dtype=np.float32)
 
     knn_dist_sq = compute_knn_distances(data_f32, k=10)
 
@@ -111,26 +130,100 @@ def compute_dim(data: Union[np.ndarray, List[np.ndarray]]) -> Dict[str, Any]:
 
 def _do_svd(data: np.ndarray) -> np.ndarray:
     """
-    Perform Singular Value Decomposition (SVD) on the input data.
-    Based on dimensions, use standard SVD or randomized SVD for efficiency.
+    Sample-covariance eigenvalues via SVD of centered data.
 
-    Parameters:
-    -----------
+    Parameters
+    ----------
     data : np.ndarray
-        Input data array.
+        Centered data of shape (n_samples, n_features).
 
-    Returns:
-    --------
+    Returns
+    -------
     np.ndarray
-        Singular values of the input data.
+        Eigenvalues ``λ_i = s_i² / (n - 1)`` in descending order.
     """
     n_samples, n_features = data.shape
+    if n_samples < 2:
+        return np.zeros(min(n_samples, n_features), dtype=np.float64)
+
     if min(n_samples, n_features) < 1000:
         s = np.linalg.svd(data, full_matrices=False, compute_uv=False)
     else:
         _, s, _ = randomized_svd(data, n_components=min(n_samples, n_features) - 1)
 
-    return s
+    return (s**2) / (n_samples - 1)
+
+
+def _do_streaming_covariance(
+    data: np.ndarray,
+    batch_size: Optional[int] = None,
+    ddof: int = 1,
+) -> np.ndarray:
+    """
+    Sample-covariance eigenvalues via batched accumulation of XᵀX.
+
+    Does not require a pre-centered full matrix copy. Accumulates in float64,
+    then returns eigenvalues of
+        C = (S - n μμᵀ) / (n - ddof)
+    in descending order, with tiny negative roundoff clipped to zero.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        Data of shape (n_samples, n_features). Need not be centered.
+    batch_size : int, optional
+        Row batch size. ``None`` processes all rows in one GEMM.
+    ddof : int
+        Divisor adjustment for the sample covariance (default 1 → n - 1).
+
+    Returns
+    -------
+    np.ndarray
+        Covariance eigenvalues in descending order.
+    """
+    if data.ndim != 2:
+        raise ValueError("data must be a 2D array of shape (n_samples, n_features).")
+
+    n_samples, n_features = data.shape
+    if n_samples == 0 or n_features == 0:
+        return np.zeros(0, dtype=np.float64)
+    if n_samples < 2:
+        return np.zeros(n_features, dtype=np.float64)
+
+    S = np.zeros((n_features, n_features), dtype=np.float64)
+    s = np.zeros(n_features, dtype=np.float64)
+    n = 0
+
+    for Xb in _iter_row_batches(data, batch_size):
+        Xb64 = np.asarray(Xb, dtype=np.float64, order="C")
+        S += Xb64.T @ Xb64
+        s += Xb64.sum(axis=0)
+        n += Xb64.shape[0]
+
+    mu = s / n
+    denom = n - ddof
+    if denom <= 0:
+        return np.zeros(n_features, dtype=np.float64)
+
+    C = S - n * np.outer(mu, mu)
+    C /= denom
+    C = 0.5 * (C + C.T)
+
+    evals = np.linalg.eigvalsh(C)  # ascending
+    evals = evals[::-1]
+    np.clip(evals, 0.0, None, out=evals)
+    return evals
+
+
+def _iter_row_batches(
+    data: np.ndarray, batch_size: Optional[int]
+) -> Iterable[np.ndarray]:
+    n_samples = data.shape[0]
+    if batch_size is None or batch_size <= 0 or batch_size >= n_samples:
+        yield data
+        return
+    for start in range(0, n_samples, batch_size):
+        yield data[start : start + batch_size]
 
 
 def _ensure_centered(data: np.ndarray, tol: float = 1e-5) -> np.ndarray:
