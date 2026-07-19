@@ -130,22 +130,20 @@ def compute_dim(
 
 def _do_svd(data: np.ndarray) -> np.ndarray:
     """
-    Sample-covariance eigenvalues via SVD of centered data.
+    Perform Singular Value Decomposition (SVD) on the input data.
+    Based on dimensions, use standard SVD or randomized SVD for efficiency.
 
-    Parameters
-    ----------
+    Parameters:
+    -----------
     data : np.ndarray
-        Centered data of shape (n_samples, n_features).
+        Input data array (centered).
 
-    Returns
-    -------
+    Returns:
+    --------
     np.ndarray
-        Eigenvalues ``λ_i = s_i² / (n - 1)`` in descending order.
+        Sample-covariance eigenvalues ``λ_i = s_i² / (n - 1)``.
     """
     n_samples, n_features = data.shape
-    if n_samples < 2:
-        return np.zeros(min(n_samples, n_features), dtype=np.float64)
-
     if min(n_samples, n_features) < 1000:
         s = np.linalg.svd(data, full_matrices=False, compute_uv=False)
     else:
