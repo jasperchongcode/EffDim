@@ -20,6 +20,8 @@ def pca_explained_variance(spectrum: np.ndarray, threshold: float = 0.95) -> int
         Number of principal components needed to reach the threshold.
     """
     total_variance = np.sum(spectrum)
+    if total_variance == 0:
+        return 1
     cumulative_variance = np.cumsum(spectrum)
     explained_variance_ratio = cumulative_variance / total_variance
 

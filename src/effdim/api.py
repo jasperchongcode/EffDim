@@ -41,9 +41,19 @@ def compute_dim(data: Union[np.ndarray, List[np.ndarray]]) -> Dict[str, Any]:
 
     # Getting the data and then converting to numpy array if it's a list
     if isinstance(data, list):
+        if len(data) == 0:
+            raise ValueError("Input data cannot be an empty list.")
         data = np.vstack(data)
     elif not isinstance(data, np.ndarray):
         raise ValueError("Input data must be a numpy array or a list of numpy arrays.")
+
+    if data.ndim != 2:
+        raise ValueError(f"Input data must be a 2D array, got {data.ndim}D.")
+    if data.shape[0] < 2:
+        raise ValueError(f"Input data must have at least 2 samples, got {data.shape[0]}.")
+
+    if not np.all(np.isfinite(data)):
+        raise ValueError("Input data contains NaN or infinity.")
 
     # Ensure the data is centered
     data = _ensure_centered(data)
@@ -67,6 +77,9 @@ def compute_dim(data: Union[np.ndarray, List[np.ndarray]]) -> Dict[str, Any]:
     )
     results["participation_ratio"] = participation_ratio(eigenvalues)
     results["shannon_entropy"] = shannon_entropy(probabilities)
+    results["stable_rank"] = stable_rank(eigenvalues)
+    results["numerical_rank"] = numerical_rank(s)
+    results["cumulative_eigenvalue_ratio"] = cumulative_eigenvalue_ratio(probabilities)
 
     # Renyi effective dimensionalities for alpha = 2,3,4,5
     for i in range(2, 6):
@@ -78,11 +91,6 @@ def compute_dim(data: Union[np.ndarray, List[np.ndarray]]) -> Dict[str, Any]:
     results["geometric_mean_eff_dimensionality"] = geometric_mean_eff_dimensionality(
         probabilities
     )
-
-    # Added Missing Spectral Estimators
-    results["stable_rank"] = stable_rank(eigenvalues)
-    results["numerical_rank"] = numerical_rank(s)
-    results["cumulative_eigenvalue_ratio"] = cumulative_eigenvalue_ratio(probabilities)
 
     # Compute KNN distances once for the largest k needed (MLE uses k=10 by default)
     # We use k=10 as a safe upper bound for default usage.
